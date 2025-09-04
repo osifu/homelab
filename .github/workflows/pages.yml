@@ -1,4 +1,4 @@
-name: Deploy GitHub Pages (from README)
+name: Deploy GitHub Pages (README → index)
 
 on:
   push:
@@ -21,19 +21,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Make README.md the site index
-      - name: Prepare site from README
+      - name: Build index.md from README.md
+        run: scripts/build_index.sh
         shell: bash
-        run: |
-          cp README.md index.md
-          if [ ! -f "_config.yml" ]; then
-            printf "%s\n" \
-              "title: HomeLab Dev Log" \
-              "description: Built from README.md" \
-              "theme: minima" \
-              "markdown: kramdown" \
-              > _config.yml
-          fi
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

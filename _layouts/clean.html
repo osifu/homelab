@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ page.title | default: site.title }} | {{ site.title }}</title>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ "/assets/css/custom.css" | relative_url }}">
+  {% seo %}
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap">
+      <a class="brand" href="{{ "/" | relative_url }}">{{ site.title }}</a>
+      {% if site.description %}<span class="tagline"> · {{ site.description }}</span>{% endif %}
+    </div>
+  </header>
+
+  <main class="wrap content">
+    {{ content }}
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <span>© {{ site.time | date: "%Y" }} · {{ site.title }}</span>
+      <span class="spacer"></span>
+      <a href="{{ site.github.repository_url }}">View on GitHub</a>
+    </div>
+  </footer>
+</body>
+</html>
