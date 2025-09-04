@@ -1,0 +1,26 @@
+:root {
+  --fg:#1f2937; --muted:#6b7280; --accent:#2563eb; --bg:#ffffff; --codebg:#0b1021; --codefg:#e5e7eb;
+}
+* { box-sizing:border-box; }
+html,body { margin:0; padding:0; background:var(--bg); color:var(--fg); font-family:Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; line-height:1.6; }
+.wrap { max-width:860px; margin:0 auto; padding:0 1rem; }
+.site-header,.site-footer { border-top:4px solid var(--accent); background:#f8fafc; }
+.site-header .wrap,.site-footer .wrap { display:flex; align-items:center; gap:.5rem; padding:.85rem 1rem; }
+.brand { font-weight:800; text-decoration:none; color:var(--fg); }
+.tagline { color:var(--muted); font-weight:600; }
+.spacer { flex:1; }
+.content { padding:2rem 1rem 3rem; }
+.content h1,.content h2,.content h3 { line-height:1.2; margin-top:2rem; }
+.content h1 { font-size:2rem; }
+.content h2 { font-size:1.4rem; }
+.content h3 { font-size:1.15rem; color:var(--muted); }
+.content a { color:var(--accent); text-decoration:none; border-bottom:1px solid rgba(37,99,235,.25); }
+.content a:hover { border-bottom-color:var(--accent); }
+.content code { font-family:"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#f1f5f9; padding:.1rem .3rem; border-radius:6px; font-size:.95em; }
+.content pre { background:var(--codebg); color:var(--codefg); padding:1rem; border-radius:10px; overflow:auto; }
+.content pre code { background:transparent; color:inherit; padding:0; }
+.content ul { padding-left:1.25rem; }
+blockquote { margin:1rem 0; padding:.75rem 1rem; border-left:4px solid var(--accent); background:#f1f5f9; color:#111827; }
+hr { border:0; height:1px; background:#e5e7eb; margin:2rem 0; }
+table { width:100%; border-collapse:collapse; font-size:.95rem; }
+td,th { border-bottom:1px solid #e5e7eb; padding:.5rem; text-align:left; }

@@ -1,0 +1,10 @@
+title: HomeLab
+description: Misadventures in self-hosting with open source, Docker, and vibes.
+theme: minima
+markdown: kramdown
+plugins:
+  - jekyll-seo-tag
+
+# Your Pages URL: https://osifu.github.io/homelab/
+url: "https://osifu.github.io"
+baseurl: "/homelab"
