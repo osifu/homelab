@@ -23,16 +23,16 @@ jobs:
 
       # Make README.md the site index
       - name: Prepare site from README
+        shell: bash
         run: |
           cp README.md index.md
-          # Optional: create a minimal Jekyll config if none exists
           if [ ! -f "_config.yml" ]; then
-            cat > _config.yml <<'CFG'
-            title: HomeLab Dev Log
-            description: Built from README.md
-            theme: minima
-            markdown: kramdown
-            CFG
+            printf "%s\n" \
+              "title: HomeLab Dev Log" \
+              "description: Built from README.md" \
+              "theme: minima" \
+              "markdown: kramdown" \
+              > _config.yml
           fi
 
       - name: Setup Pages
