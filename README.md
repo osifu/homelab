@@ -1,4 +1,4 @@
-# 🏠 HomeLab: My Misadventures in Self-Hosting
+# 🏠 HomeLab: My Adventures in Self-Hosting
 
 This repo documents my attempt to build a **HomeLab cluster** out of Intel NUCs, Raspberry Pis, and a pfSense router.  
 It’s part experiment, part documentation, and part reminder that sometimes the best way to learn is to try, fail, and write it all down.  
