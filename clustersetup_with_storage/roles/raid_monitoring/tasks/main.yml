@@ -1,0 +1,18 @@
+---
+- name: Deploy ZFS health check
+  copy:
+    dest: /usr/local/bin/check-zfs-health.sh
+    content: |
+      #!/bin/bash
+      LOG=/var/log/zfs-health.log
+      if zpool status nucpool | grep -q 'ONLINE'; then
+        echo "$(date) OK" >> $LOG
+      else
+        echo "$(date) ERROR" >> $LOG
+      fi
+    mode: '0755'
+- name: Cron for health check
+  cron:
+    name: ZFS Health
+    job: "/usr/local/bin/check-zfs-health.sh"
+    minute: "*/30"

@@ -1,0 +1,5 @@
+    - name: Enable HA on primary control plane
+      command: microk8s enable ha-cluster
+      when: inventory_hostname == primary_cp
+      register: ha_enable
+      changed_when: "'already enabled' not in ha_enable.stdout"

@@ -1,0 +1,17 @@
+---
+- name: Install MicroK8s
+  snap:
+    name: microk8s
+    state: present
+    classic: yes
+- name: Add user to microk8s group
+  user:
+    name: "{{ ansible_user }}"
+    groups: microk8s
+    append: yes
+- name: Wait for MicroK8s
+  command: microk8s status --wait-ready
+  retries: 15
+  delay: 10
+  register: status
+  until: status.rc==0

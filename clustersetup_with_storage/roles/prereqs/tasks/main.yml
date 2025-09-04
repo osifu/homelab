@@ -1,0 +1,80 @@
+---
+# --- Safe APT install helper ---
+
+# Make sure dpkg isn’t mid-flight from a previous run
+- name: Ensure dpkg is configured if needed
+  command: dpkg --configure -a
+  changed_when: false
+  failed_when: false
+
+# Wait for apt/dpkg locks (unattended-upgrades, apt-daily, etc.)
+- name: Wait for apt/dpkg locks to be released
+  shell: |
+    while fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+          fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+          fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+          fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+      sleep 3
+    done
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+# Optional: speed up by not updating cache every time (tune seconds)
+- name: Update apt cache (valid for 1 hour)
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  register: apt_update
+  retries: 3
+  delay: 5
+  until: apt_update is succeeded
+
+# Install base packages with retries, noninteractive
+- name: Install base packages
+  apt:
+    name:
+      - curl
+      - git
+      - ufw
+      - net-tools
+      - python3-pip
+    state: present
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  register: apt_install
+  retries: 5
+  delay: 8
+  until: apt_install is succeeded
+
+# Auto-recover if apt failed (broken dpkg state), then retry once
+- name: Recover from dpkg/apt errors and retry install
+  block:
+    - name: Attempt dpkg/apt auto-fix
+      shell: |
+        set -e
+        dpkg --configure -a || true
+        apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" install -f || true
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Retry base packages install after recovery
+      apt:
+        name:
+          - curl
+          - git
+          - ufw
+          - net-tools
+          - python3-pip
+        state: present
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+  when: apt_install is failed
+
+- name: Create log dir
+  file:
+    path: /var/log/ansible
+    state: directory

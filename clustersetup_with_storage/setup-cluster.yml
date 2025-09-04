@@ -1,0 +1,17 @@
+---
+- name: Deploy Full MicroK8s Cluster with ZFS-backed NFS and Monitoring
+  hosts: all
+  become: true
+  roles:
+    - prereqs
+    - ufw_control_planes
+    - microk8s_install
+    - ha_setup
+    - join_nodes
+    - label_nodes
+    - zfs_nuc_nfs
+    - k8s_storageclasses
+    - raid_monitoring
+    - grafana_prometheus_alertmanager
+    - argocd_install
+    - gitops_bootstrap

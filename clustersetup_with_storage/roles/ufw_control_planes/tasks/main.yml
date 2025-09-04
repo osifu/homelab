@@ -1,0 +1,63 @@
+---
+- name: Ensure UFW is installed
+  apt:
+    name: ufw
+    state: present
+    update_cache: yes
+  when: inventory_hostname in groups['control_planes']
+
+- name: Check if UFW is enabled
+  command: ufw status
+  register: ufw_status
+  changed_when: false
+  when: inventory_hostname in groups['control_planes']
+
+- name: Enable UFW if it is inactive
+  ufw:
+    state: enabled
+    policy: allow
+  when: 
+  - inventory_hostname in groups['control_planes']
+  - "'inactive' in ufw_status.stdout"
+
+
+- name: Gather MicroK8s enabled addons
+  command: microk8s status --format short
+  register: microk8s_status
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname in groups['control_planes']
+
+- name: Detect if Flannel or Calico is enabled
+  set_fact:
+    use_vxlan: "{{ 'flannel' in microk8s_status.stdout or 'calico' in microk8s_status.stdout or force_open_overlay_ports }}"
+  when: inventory_hostname in groups['control_planes']
+
+- name: Allow required control plane ports
+  ufw:
+    rule: allow
+    port: "{{ item.port }}"
+    proto: "{{ item.proto }}"
+  loop: "{{ microk8s_cp_ports }}"
+  when: inventory_hostname in groups['control_planes']
+
+- name: Allow overlay networking ports dynamically
+  ufw:
+    rule: allow
+    port: "{{ item.port }}"
+    proto: "{{ item.proto }}"
+  loop: "{{ vxlan_ports }}"
+  when: 
+  - inventory_hostname in groups['control_planes']
+  - use_vxlan | bool
+
+- name: Verify UFW final status
+  command: ufw status verbose
+  register: ufw_final_status
+  changed_when: false
+  when: inventory_hostname in groups['control_planes']
+
+- name: Show UFW rules applied
+  debug:
+    msg: "{{ ufw_final_status.stdout_lines }}"
+  when: inventory_hostname in groups['control_planes']

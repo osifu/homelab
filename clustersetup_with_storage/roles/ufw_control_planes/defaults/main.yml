@@ -1,0 +1,21 @@
+---
+# Default ports required for MicroK8s control planes
+microk8s_cp_ports:
+  - { port: "22",     proto: "tcp", desc: "SSH management" }
+  - { port: "25000",  proto: "tcp", desc: "MicroK8s API HA cluster" }
+  - { port: "19001",  proto: "tcp", desc: "etcd peer 1" }
+  - { port: "19002",  proto: "tcp", desc: "etcd peer 2" }
+  - { port: "19003",  proto: "tcp", desc: "etcd peer 3" }
+  - { port: "16443",  proto: "tcp", desc: "Kubernetes API server" }
+  - { port: "10250",  proto: "tcp", desc: "Kubelet API" }
+  - { port: "10255",  proto: "tcp", desc: "Kubelet read-only" }
+  - { port: "30000:32767", proto: "tcp", desc: "NodePort range" }
+
+# Additional ports for overlays
+vxlan_ports:
+  - { port: "8472", proto: "udp", desc: "Flannel VXLAN" }
+  - { port: "4789", proto: "udp", desc: "Generic VXLAN (Calico/Canal)" }
+
+# Set to true if you want to open overlay ports even if detection fails
+force_open_overlay_ports: false
+enable_local_path: false

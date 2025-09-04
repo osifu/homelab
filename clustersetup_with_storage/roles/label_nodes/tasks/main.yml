@@ -1,0 +1,27 @@
+---
+- name: Detect architecture
+  command: uname -m
+  register: arch_cmd
+  
+- name: Apply labels based on architecture
+  command: >
+    microk8s kubectl label node {{ inventory_hostname }} arch={{ arch_cmd.stdout }}
+  delegate_to: "{{ primary_cp }}"
+
+- name: Label Raspberry Pi nodes explicitly
+  command: >
+    microk8s kubectl label node {{ inventory_hostname }} device-type=raspberrypi --overwrite
+  delegate_to: "{{ primary_cp }}"
+  when: "'rpi' in inventory_hostname"
+
+- name: Label Intel Macs
+  command: >
+    microk8s kubectl label node {{ inventory_hostname }} device-type=mac-intel --overwrite
+  delegate_to: "{{ primary_cp }}"
+  when: "'mac-intel' in inventory_hostname"
+
+- name: Label Apple Silicon Macs
+  command: >
+    microk8s kubectl label node {{ inventory_hostname }} device-type=mac-arm --overwrite
+  delegate_to: "{{ primary_cp }}"
+  when: "'mac-m1' in inventory_hostname"

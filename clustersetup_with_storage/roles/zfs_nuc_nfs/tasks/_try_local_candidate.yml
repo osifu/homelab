@@ -1,0 +1,51 @@
+# expects var: cand (by-id absolute path, e.g. /dev/disk/by-id/nvme-XYZ)
+
+- name: Verify candidate resolves to a block device
+  stat:
+    path: "{{ cand }}"
+    follow: yes
+  register: cand_stat
+
+- name: Skip candidate if not a block device
+  debug:
+    msg: "Skipping {{ cand }}: not a block device."
+  when: not cand_stat.stat.exists
+
+- name: Check filesystem on candidate (whole disk)
+  shell: |
+    set -euo pipefail
+    real=$(readlink -f '{{ cand }}')
+    lsblk --nodeps -no NAME,FSTYPE,MOUNTPOINT "$real" | awk '$2 != "" || $3 != ""' || true
+  args: { executable: /bin/bash }
+  register: cand_fs
+  changed_when: false
+  when: cand_stat.stat.exists
+
+# destructive wipe, never for OS disk (already excluded), only if both flags set
+- name: Clear ZFS label / FS on candidate (DESTRUCTIVE)
+  command: zpool labelclear -f "{{ cand }}"
+  when:
+    - cand_stat.stat.exists
+    - (cand_fs.stdout | default('')) | length > 0
+    - (allow_local_wipe | default(false) | bool)
+    - (confirm_local_destroy | default(false) | bool)
+
+- name: Create local ZFS pool on candidate
+  command:
+    argv: ["zpool","create","-f","{{ local_zfs_pool }}","{{ cand }}"]
+  register: create_local_zpool
+  failed_when: false
+  when: cand_stat.stat.exists
+
+- name: Mark success if pool created
+  set_fact:
+    local_pool_created: true
+    local_pool_device: "{{ cand }}"
+  when: create_local_zpool.rc == 0
+
+- name: Report failure on candidate (will try next)
+  debug:
+    msg: "Creation failed on {{ cand }}: {{ create_local_zpool.stderr | default('') }}"
+  when:
+    - cand_stat.stat.exists
+    - create_local_zpool.rc != 0

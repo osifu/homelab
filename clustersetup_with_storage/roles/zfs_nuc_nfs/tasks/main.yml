@@ -1,0 +1,551 @@
+# --- Detect stable USB by-id whole disks on pool host ---
+- name: Detect USB whole-disk by-id symlinks (exclude partitions)
+  shell: |
+    set -euo pipefail
+    cd /dev/disk/by-id
+    ls -1 usb-* 2>/dev/null | grep -Ev -- '-part[0-9]+$' || true
+  args: { executable: /bin/bash }
+  register: usb_byid_raw
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == zfs_pool_host
+
+# 1) Start from the raw names (e.g., "usb-WD_..."), optionally filter by vendor/model text
+- name: Select by-id entries (optionally filtered)
+  set_fact:
+    external_byid_names: >-
+      {{
+        (usb_byid_raw.stdout_lines | default([]))
+        | select('search', usb_enclosure_filter, ignorecase=True)
+        | list
+        if (usb_enclosure_filter | default('')) | length > 0
+        else
+        (usb_byid_raw.stdout_lines | default([]))
+      }}
+  when: inventory_hostname == zfs_pool_host
+
+# 2) Turn names into absolute paths WITHOUT backrefs
+- name: Build absolute /dev/disk/by-id paths
+  set_fact:
+    external_zfs_devices_byid: >-
+      {{
+        external_byid_names
+        | map('regex_replace','^','/dev/disk/by-id/')
+        | list
+      }}
+  when: inventory_hostname == zfs_pool_host
+
+
+- name: Fail if no USB by-id whole disks were detected on pool host
+  fail:
+    msg: >
+      No USB by-id whole-disk symlinks under /dev/disk/by-id (usb-*).
+      Ensure the enclosure is powered/connected, or set `usb_enclosure_filter`.
+  when:
+    - inventory_hostname == zfs_pool_host
+    - (external_zfs_devices_byid | default([])) | length == 0
+
+- name: Verify by-id symlinks resolve to block devices
+  stat:
+    path: "{{ item }}"
+    follow: yes
+  loop: "{{ external_zfs_devices_byid }}"
+  register: byid_stats
+  when: inventory_hostname == zfs_pool_host
+
+- name: Fail if any by-id symlink does not resolve to a block device
+  fail:
+    msg: "Symlink {{ item.item }} does not resolve to a block device (enclosure/drive may be missing)."
+  loop: "{{ byid_stats.results | default([]) }}"
+  when:
+    - inventory_hostname == zfs_pool_host
+    - not item.stat.exists
+
+# --- Pool existence ---
+- name: Check if external ZFS pool exists (on pool host)
+  command: zpool list -H -o name
+  register: external_pool_list
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == zfs_pool_host
+
+- name: Set fact for external pool existence
+  set_fact:
+    external_pool_exists: "{{ external_zfs_pool in (external_pool_list.stdout_lines | default([])) }}"
+  when: inventory_hostname == zfs_pool_host
+
+# --- Filesystem safety (treat ANY FSTYPE incl. zfs_member or mountpoint as not clean) ---
+- name: Check filesystems on external devices (even if pool exists)
+  shell: |
+    set -euo pipefail
+    for dev in {{ external_zfs_devices_byid | join(' ') }}; do
+      lsblk --nodeps -no NAME,FSTYPE,MOUNTPOINT "$dev" | awk '$2 != "" || $3 != ""'
+    done
+  args: { executable: /bin/bash }
+  register: fs_check
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == zfs_pool_host
+
+- name: Debug detected filesystems on external devices
+  debug:
+    msg: "{{ fs_check.stdout_lines }}"
+  when:
+    - inventory_hostname == zfs_pool_host
+    - (fs_check | default({})).stdout | default('') | length > 0
+
+# --- Optional destructive labelclear helper (double gated) ---
+- name: Clear ZFS labels on external devices (DESTRUCTIVE)
+  command: zpool labelclear -f {{ item }}
+  loop: "{{ external_zfs_devices_byid }}"
+  when:
+    - inventory_hostname == zfs_pool_host
+    - (fs_check | default({})).stdout | default('') | length > 0
+    - (allow_external_wipe | default(false) | bool)
+    - (confirm_external_destroy | default(false) | bool)
+
+- name: Fail if filesystems found and not allowed to wipe
+  fail:
+    msg: "❌ Filesystems found on external devices. Set allow_external_wipe=true and confirm_external_destroy=true to proceed."
+  when:
+    - inventory_hostname == zfs_pool_host
+    - (fs_check | default({})).stdout | default('') | length > 0
+    - not ((allow_external_wipe | default(false) | bool) and (confirm_external_destroy | default(false) | bool))
+
+# --- Create pool (argv to avoid quoting issues) ---
+- name: Create external ZFS pool if not exists and devices are clean/cleared
+  command:
+    argv: "{{ ['zpool','create','-f', external_zfs_pool] + external_zfs_devices_byid }}"
+  register: create_external_zpool
+  failed_when: create_external_zpool.rc != 0
+  when:
+    - inventory_hostname == zfs_pool_host
+    - not (external_pool_exists | default(false) | bool)
+
+# --- Dataset and mount on pool host only ---
+- name: Check datasets
+  command: zfs list -H -o name
+  register: external_ds_list
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == zfs_pool_host
+
+- name: Create external ZFS dataset
+  command: >
+    zfs create -o mountpoint=/mnt/{{ external_zfs_pool }} {{ external_zfs_dataset }}
+  when:
+    - inventory_hostname == zfs_pool_host
+    - external_zfs_dataset not in (external_ds_list.stdout_lines | default([]))
+
+- name: Abort if pool I/O is suspended (avoid mount failures)
+  shell: |
+    set -euo pipefail
+    zpool status {{ external_zfs_pool }} | grep -q "suspended"
+  register: pool_suspended_check
+  failed_when: false
+  changed_when: false
+  when: inventory_hostname == zfs_pool_host
+
+- name: Fail if pool I/O is suspended
+  fail:
+    msg: "❌ ZFS pool '{{ external_zfs_pool }}' I/O is suspended. Fix enclosure/cabling and run 'zpool status -v {{ external_zfs_pool }}'."
+  when:
+    - inventory_hostname == zfs_pool_host
+    - pool_suspended_check.rc == 0
+
+- name: Check if dataset is mounted
+  command: zfs get -H -o value mounted {{ external_zfs_dataset }}
+  register: ds_mounted
+  changed_when: false
+  when: inventory_hostname == zfs_pool_host
+
+- name: Mount dataset if not mounted
+  command: zfs mount {{ external_zfs_dataset }}
+  when: 
+  - inventory_hostname == zfs_pool_host
+  - ds_mounted.stdout.strip() != 'yes'
+
+
+# --- Local per-node pool: detect a stable by-id device per host ---
+# --- Local per-node ZFS pool: exclude OS/root disk, try multiple candidates, stop on first success ---
+
+# Discover the root block device's base disk (e.g., nvme0n1, sda, mmcblk0)
+- name: Detect root source for /
+  command: findmnt -no SOURCE /
+  register: root_src
+  changed_when: false
+
+- name: Derive root base disk name (PKNAME of root)
+  shell: |
+    set -euo pipefail
+    ROOT=$(readlink -f "{{ root_src.stdout | trim }}")
+    # Get the parent disk (PKNAME). If empty (root is the disk), print the name.
+    PK=$(lsblk -no PKNAME "$ROOT" | head -n1)
+    if [ -n "$PK" ]; then
+      echo "$PK"
+    else
+      lsblk -no NAME "$ROOT" | head -n1
+    fi
+  args: { executable: /bin/bash }
+  register: root_base_name
+  changed_when: false
+
+- name: Build absolute path for root base disk
+  set_fact:
+    root_base_dev: "/dev/{{ root_base_name.stdout | trim }}"
+
+# Collect all local by-id whole-disk candidates in priority order (exclude partitions)
+- name: Detect candidate local by-id whole disks (NVMe > ATA > MMC)
+  shell: |
+    set -euo pipefail
+    cd /dev/disk/by-id || exit 0
+    {
+      ls -1 nvme-* 2>/dev/null | grep -Ev -- '-part[0-9]+$'
+      ls -1 ata-*  2>/dev/null | grep -Ev -- '-part[0-9]+$'
+      ls -1 mmc-*  2>/dev/null | grep -Ev -- '-part[0-9]+$'
+    } | awk 'NF' | uniq
+  args: { executable: /bin/bash }
+  register: local_byid_all
+  changed_when: false
+  failed_when: false
+
+- name: Build absolute /dev/disk/by-id paths for local candidates
+  set_fact:
+    local_byid_candidates_all: >-
+      {{
+        (local_byid_all.stdout_lines | default([]))
+        | map('regex_replace','^','/dev/disk/by-id/')
+        | list
+      }}
+
+# Exclude any candidate that resolves to the root base disk (never touch OS disk)
+- name: Exclude OS/root disk from candidates
+  shell: |
+    set -euo pipefail
+    ROOT="{{ root_base_dev }}"
+    out=""
+    for id in {{ (local_byid_candidates_all | map('quote') | join(' ')) }}; do
+      real=$(readlink -f "$id" || true)
+      # Get the base disk name for this candidate
+      base=$(lsblk -no PKNAME "$real" | head -n1)
+      if [ -z "$base" ]; then
+        base=$(lsblk -no NAME "$real" | head -n1)
+      fi
+      [ -z "$base" ] && continue
+      if [ "/dev/$base" != "$ROOT" ]; then
+        echo "$id"
+      fi
+    done
+  args: { executable: /bin/bash }
+  register: local_byid_filtered
+  changed_when: false
+  failed_when: false
+
+- name: Set filtered local candidates
+  set_fact:
+    local_byid_candidates: "{{ local_byid_filtered.stdout_lines | default([]) }}"
+
+- name: Debug local by-id candidates
+  debug:
+    msg: "Local by-id candidates: {{ local_byid_candidates | default([]) }}"
+
+- name: Skip local pool setup if no local candidates (or only OS disk was found)
+  meta: end_host
+  when: (local_byid_candidates | length) == 0
+
+# pool existence
+- name: Check if local ZFS pool exists
+  command: zpool list -H -o name
+  register: local_pool_list
+  changed_when: false
+  failed_when: false
+
+- name: Set fact for local pool existence
+  set_fact:
+    local_pool_exists: "{{ local_zfs_pool in (local_pool_list.stdout_lines | default([])) }}"
+
+# control flag for newly created pool (init false)
+- set_fact:
+    local_pool_created: false
+
+# try candidates only if pool does NOT already exist
+- name: Try local pool candidates
+  include_tasks: _try_local_candidate.yml
+  loop: "{{ local_byid_candidates }}"
+  loop_control:
+    loop_var: cand
+    label: "{{ cand }}"
+  when:
+    - not local_pool_exists | bool
+    - not local_pool_created | bool
+
+# consider pool "ready" if it already existed OR we just created it
+- set_fact:
+    local_pool_ready: "{{ (local_pool_exists | bool) or (local_pool_created | bool) }}"
+
+- name:
+    Debug local pool readiness
+  debug:
+    msg: "Local ZFS pool '{{ local_zfs_pool }}' is ready: {{ local_pool_ready | bool }}"
+
+
+# dataset + mount are allowed when pool is ready (exists or newly created)
+- name: Check local datasets
+  command: zfs list -H -o name
+  register: local_ds_list
+  changed_when: false
+  failed_when: false
+  when: local_pool_ready | bool
+
+- name: Create local ZFS dataset
+  command: >
+    zfs create -o mountpoint=/mnt/{{ local_zfs_pool }} {{ local_zfs_dataset }}
+  when:
+    - local_pool_ready | bool
+    - local_zfs_dataset not in (local_ds_list.stdout_lines | default([]))
+
+- name: Ensure local dataset is mounted
+  command: zfs mount {{ local_zfs_dataset }}
+  register: local_dataset_mount
+  failed_when: >
+    local_dataset_mount.rc != 0 and
+    ('already mounted' not in (local_dataset_mount.stderr | lower))
+  when: local_pool_ready | bool
+
+# --- NFS server setup & export wiring (pool host only) ---
+
+- name: Ensure facts present (for IP)
+  setup:
+  when: inventory_hostname == zfs_pool_host
+
+- name: Install NFS server
+  apt:
+    name: nfs-kernel-server
+    state: present
+    update_cache: yes
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  when: inventory_hostname == zfs_pool_host
+
+# Try to read the ZFS mountpoint from the dataset; fallback to nfs_export_dir
+- name: Get ZFS dataset mountpoint
+  command: zfs get -H -o value mountpoint {{ external_zfs_dataset }}
+  register: zfs_mp
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == zfs_pool_host
+
+- name: Decide export path (dataset mountpoint or fallback)
+  set_fact:
+    nfs_export_path: >-
+      {{
+        (zfs_mp.stdout | trim) if (zfs_mp.stdout | default('') | trim) not in ['-', 'legacy', 'none', ''] 
+        else nfs_export_dir
+      }}
+  when: inventory_hostname == zfs_pool_host
+
+- name: 
+    Debug NFS export path
+  debug:
+    msg: "NFS export path: {{ nfs_export_path }}"
+  when: inventory_hostname == zfs_pool_host
+
+- name: Ensure export directory exists
+  file:
+    path: "{{ nfs_export_path }}"
+    state: directory
+    mode: "0777"
+  when: inventory_hostname == zfs_pool_host
+
+# Write exports line idempotently
+- name: Ensure NFS export line exists
+  lineinfile:
+    path: /etc/exports
+    line: "{{ nfs_export_path }} *( {{ nfs_export_options }} )"
+    create: yes
+    state: present
+    regexp: "^{{ nfs_export_path | regex_escape() }}\\s"
+  notify: reload nfs exports
+  when: inventory_hostname == zfs_pool_host
+
+- name: 
+    Debug NFS export options
+  debug:
+    msg: "NFS export options: {{ nfs_export_options }}"
+  when: inventory_hostname == zfs_pool_host
+
+- name: Ensure nfs-kernel-server is installed
+  apt:
+    name: nfs-kernel-server
+    state: present
+    update_cache: yes
+  become: true
+
+- name: Ensure /etc/exports.d exists
+  file:
+    path: /etc/exports.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  become: true
+
+# Important: neutralize any broken lines in /etc/exports
+- name: Replace /etc/exports with header (manage entries via /etc/exports.d)
+  copy:
+    dest: /etc/exports
+    content: |
+      # Managed by Ansible. Place exports in /etc/exports.d/*.exports
+    owner: root
+    group: root
+    mode: '0644'
+    backup: yes
+  become: true
+
+# Write a clean, normalized export (no spaces inside the () and no trailing /)
+- name: Write export entry for nucpool
+  vars:
+    _path: "{{ (nfs_export_path | default('/mnt/nucpool')) | regex_replace('/+$','') }}"
+    _cidr: "{{ nfs_client_cidr | default('10.0.0.0/24') }}"
+  copy:
+    dest: /etc/exports.d/nucpool.exports
+    content: "{{ _path }} {{ _cidr }}(rw,sync,no_subtree_check,no_root_squash)\n"
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+
+- name: Reload NFS exports
+  command: exportfs -ra
+  register: exportfs_reload
+  changed_when: false
+  failed_when: exportfs_reload.rc != 0
+  become: true
+
+- name: Verify export present
+  command: exportfs -v
+  register: exportfs_v
+  changed_when: false
+  become: true
+
+# Recollect to be sure we have fresh output (on the NFS host)
+- name: Collect exportfs -v
+  command: exportfs -v
+  register: exportfs_v
+  changed_when: false
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+  become: true
+
+# Normalize expected path (strip trailing /)
+- name: Compute expected path
+  set_fact:
+    expected_export_path: "{{ (nfs_export_path | default('/mnt/nucpool')) | regex_replace('/+$','') }}"
+  run_once: true
+
+# Parse ONLY the paths from exportfs output:
+#  - paths that start the line:        ^/path
+#  - paths that appear after a colon:  host:/path
+- name: Extract exported paths
+  vars:
+    _stdout: "{{ exportfs_v.stdout | default('') }}"
+    _paths_start: "{{ _stdout | regex_findall('(?m)^/[^\\s(]+') }}"
+    _after_colon_raw: "{{ _stdout | regex_findall('(?m):/[^\\s(]+') }}"
+    _after_colon: "{{ _after_colon_raw | map('regex_replace', '^:', '') | list }}"
+  set_fact:
+    exported_paths: "{{ (_paths_start + _after_colon)
+                        | map('regex_replace','/+$','')
+                        | unique
+                        | list }}"
+  run_once: true
+
+# Optional: see what we parsed
+- debug:
+    var: exported_paths
+  run_once: true
+
+- name: Assert export exists
+  assert:
+    that:
+      - expected_export_path in exported_paths
+    fail_msg: "NFS export {{ expected_export_path }} not found. Saw: {{ exported_paths }}"
+  when: inventory_hostname == zfs_pool_host
+
+
+
+
+- name: 
+    Debug NFS export assertion
+  debug:
+    msg: "NFS export {{ expected_export_path }} is present in exportfs -v output."
+  when: inventory_hostname == zfs_pool_host
+
+
+# Compute & expose the values you need for the StorageClass
+- name: Set NFS server/share facts
+  set_fact:
+    nfs_server_ip: "{{ ansible_default_ipv4.address | default(ansible_all_ipv4_addresses[0]) }}"
+    nfs_share_path: "{{ nfs_export_path }}"
+  when: inventory_hostname == zfs_pool_host
+
+- name: Show NFS server and share for CSI
+  debug:
+    msg:
+      - "NFS server (use in StorageClass.parameters.server): {{ nfs_server_ip }}"
+      - "NFS share  (use in StorageClass.parameters.share):  {{ nfs_share_path }}"
+  when: inventory_hostname == zfs_pool_host
+
+# Optional: generate a StorageClass manifest using those values
+- name: Render NFS StorageClass manifest
+  copy:
+    dest: /tmp/storageclass-nfs.yaml
+    content: |
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: nfs-csi
+      provisioner: nfs.csi.k8s.io
+      parameters:
+        server: {{ nfs_server_ip }}
+        share: {{ nfs_share_path }}
+      mountOptions:
+        - nfsvers=4.1
+      reclaimPolicy: Delete
+      volumeBindingMode: Immediate
+      allowVolumeExpansion: true
+  when: inventory_hostname == zfs_pool_host
+
+- name: Apply NFS StorageClass
+  command: microk8s kubectl apply -f /tmp/storageclass-nfs.yaml
+  register: sc_apply
+  changed_when: "'created' in (sc_apply.stdout | default('')) or 'configured' in (sc_apply.stdout | default(''))"
+  when: inventory_hostname == zfs_pool_host
+
+# Mark nodes that have the local ZFS pool (localfastpool)
+- name: Check if local ZFS pool exists on this node
+  command: zpool list -H -o name
+  register: _node_zpools
+  changed_when: false
+  failed_when: false
+
+- name: Set fact if this node has {{ local_zfs_pool }}
+  set_fact:
+    node_has_local_zfs: "{{ local_zfs_pool in (_node_zpools.stdout_lines | default([])) }}"
+
+# Collect node names with local ZFS (run on control host)
+- name: Build list of k8s nodes that have {{ local_zfs_pool }}
+  set_fact:
+    zfs_nodes: >-
+      {{
+        (zfs_nodes | default([]))
+        + ([inventory_hostname] if (hostvars[inventory_hostname].node_has_local_zfs | default(false)) else [])
+      }}
+  run_once: true
+  delegate_to: "{{ zfs_pool_host }}"
+
+- name: Debug list of ZFS-enabled nodes
+  debug:
+    var: zfs_nodes
+  run_once: true
+  delegate_to: "{{ zfs_pool_host }}"
+
