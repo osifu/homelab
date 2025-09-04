@@ -1,0 +1,528 @@
+# 0) Safety: compute a reasonable delegate host if zfs_pool_host isn't a simple string
+- name: Pick delegate host (fall back to inventory_hostname)
+  set_fact:
+    _delegate_host: "{{ (zfs_pool_host | string) if (zfs_pool_host | string | length > 0) else inventory_hostname }}"
+  run_once: true
+
+# 1) Make sure MicroK8s helm3 is on (idempotent)
+- name: Enable microk8s helm3 (idempotent)
+  command: microk8s enable helm3
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ _delegate_host }}"
+  run_once: true
+
+# 1) Repo add/update (idempotent)
+- name: Add openebs repo
+  command: microk8s helm3 repo add openebs https://openebs.github.io/openebs
+  register: add_repo
+  failed_when: false
+  changed_when: "'has been added' in (add_repo.stdout | default(''))"
+  run_once: true
+  delegate_to: "{{ zfs_pool_host }}"
+
+- name: Add prometheus-community repo
+  command: microk8s helm3 repo add prometheus-community https://prometheus-community.github.io/helm-charts
+  register: add_repo
+  failed_when: false
+  changed_when: "'has been added' in (add_repo.stdout | default(''))"
+  run_once: true
+  delegate_to: "{{ zfs_pool_host }}"
+
+- name: Helm repo update
+  command: microk8s helm3 repo update
+  changed_when: false
+  run_once: true
+  delegate_to: "{{ zfs_pool_host }}"
+
+# 3) Ensure OpenEBS ZFS uses the MicroK8s kubelet dir, disable components we don't need
+- name: Build OpenEBS values (ZFS-only + kubeletDir for MicroK8s)
+  set_fact:
+    _openebs_values:
+      engines:
+        replicated:
+          mayastor:
+            enabled: false
+      loki:
+        enabled: false
+      alloy:
+        enabled: false
+      localpv-provisioner:
+        enabled: false
+      lvm-localpv:
+        enabled: false
+      zfs-localpv:
+        zfsNode:
+          kubeletDir: "{{ microk8s_kubelet_dir }}"
+
+- name: Write OpenEBS values file
+  copy:
+    dest: /tmp/openebs-values.yaml
+    content: "{{ _openebs_values | to_nice_yaml }}"
+  delegate_to: "{{ _delegate_host }}"
+  run_once: true
+
+- name: Install/upgrade OpenEBS (wait)
+  command: >
+    microk8s helm3 upgrade --install openebs openebs/openebs
+    --namespace openebs --create-namespace
+    --wait --timeout 10m
+    -f /tmp/openebs-values.yaml
+  register: _openebs_apply
+  changed_when: >
+    'STATUS: deployed' in (_openebs_apply.stdout | default('')) or
+    'STATUS: upgraded' in (_openebs_apply.stdout | default(''))
+  delegate_to: "{{ _delegate_host }}"
+  run_once: true
+
+- name: DEBUG - openebs apply stdout
+  debug:
+    var: _openebs_apply.stdout_lines
+  run_once: true
+
+- name: Rollout restart ZFS LocalPV node DaemonSet (ensure env is applied)
+  command: microk8s kubectl -n openebs rollout restart ds openebs-zfs-localpv-node
+  changed_when: false
+  delegate_to: "{{ _delegate_host }}"
+  run_once: true
+
+- name: Wait for ZFS LocalPV node DaemonSet
+  command: microk8s kubectl -n openebs rollout status ds openebs-zfs-localpv-node --timeout=5m
+  register: _zfs_ds_rollout
+  retries: 3
+  delay: 10
+  until: _zfs_ds_rollout.rc == 0
+  delegate_to: "{{ _delegate_host }}"
+  run_once: true
+
+- name: Verify ZFS node plugin KUBELET_DIR env (should match MicroK8s path)
+  command: >
+    microk8s kubectl -n openebs get ds openebs-zfs-localpv-node
+    -o jsonpath={..env[?(@.name=="KUBELET_DIR")].value}
+  register: _zfs_kubelet_env
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ _delegate_host }}"
+  run_once: true
+
+- name: DEBUG - KUBELET_DIR env
+  debug:
+    msg: "ZFS node KUBELET_DIR='{{ _zfs_kubelet_env.stdout | default('') }}' (expected: {{ microk8s_kubelet_dir }})"
+  run_once: true
+
+# 4) Make sure the monitoring namespace exists and is PSA-friendly
+- name: Create monitoring namespace (idempotent)
+  command: microk8s kubectl create namespace {{ grafana_namespace }}
+  register: _ns_create
+  changed_when: "'created' in (_ns_create.stdout | default(''))"
+  failed_when: false
+  delegate_to: "{{ _delegate_host }}"
+  run_once: true
+
+- name: Label namespace for permissive Pod Security (avoid PSA blocks)
+  command: >
+    microk8s kubectl label ns {{ grafana_namespace }}
+    pod-security.kubernetes.io/enforce=privileged
+    pod-security.kubernetes.io/audit=privileged
+    pod-security.kubernetes.io/warn=privileged --overwrite
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ _delegate_host }}"
+  run_once: true
+
+# 5) Build kube-prometheus-stack values (ZFS persistence, safe webhooks, node-exporter fix)
+- name: Build kube-prometheus-stack values
+  set_fact:
+    _kps_values:
+      prometheusOperator:
+        admissionWebhooks:
+          enabled: false        # keep enabled
+          patch:
+            enabled: false     # but skip the patch job which often fails on edge clusters
+      grafana:
+        persistence:
+          enabled: true
+          storageClassName: "{{ sc_zfs_localpv }}"
+          size: "{{ kps_grafana_size }}"
+      alertmanager:
+        config: "{{ kps_alertmanager_config }}"
+        alertmanagerSpec:
+          storage:
+            volumeClaimTemplate:
+              spec:
+                storageClassName: "{{ sc_zfs_localpv }}"
+                resources:
+                  requests:
+                    storage: "{{ kps_alertmanager_size }}"
+      prometheus:
+        prometheusSpec:
+          storageSpec:
+            volumeClaimTemplate:
+              spec:
+                storageClassName: "{{ sc_zfs_localpv }}"
+                resources:
+                  requests:
+                    storage: "{{ kps_prometheus_size }}"
+      # Fix the warning about privileged under the right key (container securityContext)
+      prometheus-node-exporter:
+        hostNetwork: true
+        hostPID: true
+        securityContext: {}
+        containerSecurityContext:
+          privileged: true
+
+- name: Write kube-prometheus-stack values file
+  copy:
+    dest: /tmp/kps-values.yaml
+    content: "{{ _kps_values | to_nice_yaml }}"
+  delegate_to: "{{ _delegate_host }}"
+  run_once: true
+
+# 6) Install/upgrade kube-prometheus-stack (no --wait; we'll do explicit rollouts next)
+# Build base argv
+- name: Build Helm argv for kube-prometheus-stack
+  set_fact:
+    __kps_argv:
+      - microk8s
+      - helm3
+      - upgrade
+      - --install
+      - kube-prometheus-stack
+      - prometheus-community/kube-prometheus-stack
+      - --namespace
+      - "{{ grafana_namespace }}"
+      - --create-namespace
+      - -f
+      - /tmp/kps-values.yaml
+
+# Append chart version if provided (safe)
+- name: Append chart version if provided
+  set_fact:
+    __kps_argv: "{{ __kps_argv + ['--version', (kps_version | string)] }}"
+  when: kps_version is defined and (kps_version | string | length) > 0
+
+# Run helm upgrade/install using argv
+- name: Install/upgrade kube-prometheus-stack
+  command:
+    argv: "{{ __kps_argv }}"
+  register: _kps_install
+  changed_when: >
+    'STATUS: deployed' in (_kps_install.stdout | default('')) or
+    'STATUS: upgraded' in (_kps_install.stdout | default(''))
+  delegate_to: "{{ _delegate_host | default(inventory_hostname) }}"
+  run_once: true
+
+
+# 7) Wait for components, with helpful debug if something times out
+
+- name: Wait for operator deployment
+  command: >
+    microk8s kubectl -n {{ grafana_namespace }}
+    rollout status deploy kube-prometheus-stack-operator --timeout=5m
+  register: _op_rollout
+  retries: 1
+  delay: 5
+  until: _op_rollout.rc == 0
+  delegate_to: "{{ _delegate_host }}"
+  run_once: true
+
+# Bounce Prometheus pods to retry mounts in case we just fixed kubeletDir
+- name: Delete Prometheus pods to force re-mount
+  command: >
+    microk8s kubectl -n {{ grafana_namespace }}
+    delete pod -l app.kubernetes.io/name=prometheus --wait=false
+  register: _prom_pod_delete
+  changed_when: "'deleted' in (_prom_pod_delete.stdout | default(''))"
+  failed_when: false
+  delegate_to: "{{ _delegate_host }}"
+  run_once: true
+
+- block:
+    - name: Wait for Alertmanager STS
+      command: >
+        microk8s kubectl -n {{ grafana_namespace }}
+        rollout status sts alertmanager-kube-prometheus-stack-alertmanager --timeout=15m
+      register: _am_rollout
+      delegate_to: "{{ _delegate_host }}"
+      run_once: true
+
+  rescue:
+    - name: DEBUG Alertmanager pod events
+      shell: |
+        set -euo pipefail
+        POD=$(microk8s kubectl -n {{ grafana_namespace }} get pods -l app.kubernetes.io/name=alertmanager -o jsonpath='{.items[0].metadata.name}' || true)
+        if [ -n "$POD" ]; then
+          microk8s kubectl -n {{ grafana_namespace }} describe pod "$POD" | sed -n '/Events:/,$p'
+        else
+          echo "No alertmanager pod found"
+        fi
+      register: _am_events
+      changed_when: false
+      delegate_to: "{{ _delegate_host }}"
+      run_once: true
+
+    - debug:
+        var: _am_events.stdout_lines
+      run_once: true
+
+    - fail:
+        msg: "Alertmanager failed to become Ready within timeout. See events above."
+
+- block:
+    - name: Wait for Prometheus STS
+      command: >
+        microk8s kubectl -n {{ grafana_namespace }}
+        rollout status sts prometheus-kube-prometheus-stack-prometheus --timeout=20m
+      register: _prom_rollout
+      delegate_to: "{{ _delegate_host }}"
+      run_once: true
+
+  rescue:
+    - name: DEBUG Prometheus pod events
+      shell: |
+        set -euo pipefail
+        POD=$(microk8s kubectl -n {{ grafana_namespace }} get pods -l app.kubernetes.io/name=prometheus -o jsonpath='{.items[0].metadata.name}' || true)
+        if [ -n "$POD" ]; then
+          microk8s kubectl -n {{ grafana_namespace }} describe pod "$POD" | sed -n '/Events:/,$p'
+        else
+          echo "No prometheus pod found"
+        fi
+      register: _prom_events
+      changed_when: false
+      delegate_to: "{{ _delegate_host }}"
+      run_once: true
+
+    - debug:
+        var: _prom_events.stdout_lines
+      run_once: true
+
+    - fail:
+        msg: "Prometheus failed to become Ready within timeout. See events above."
+
+# Optional: wait for Grafana deployment (often pulls a big image on first run)
+- name: Wait for Grafana deployment
+  command: >
+    microk8s kubectl -n {{ grafana_namespace }}
+    rollout status deploy kube-prometheus-stack-grafana --timeout=10m
+  register: _graf_rollout
+  retries: 1
+  delay: 5
+  until: _graf_rollout.rc == 0
+  delegate_to: "{{ _delegate_host }}"
+  run_once: true
+
+# Final helpful output
+- name: Show key resources
+  command: >
+    microk8s kubectl -n {{ grafana_namespace }} get pods,deploy,sts,pvc -o wide
+  register: _final_get
+  changed_when: false
+  delegate_to: "{{ _delegate_host }}"
+  run_once: true
+
+- debug:
+    var: _final_get.stdout_lines
+  run_once: true
+
+- name: Set sensible defaults for ingress vars
+  set_fact:
+    ingress_class: "{{ ingress_class | default('nginx') }}"
+    grafana_namespace: "{{ grafana_namespace | default('monitoring') }}"
+    grafana_host: "{{ grafana_host | default('grafana.local') }}"
+    grafana_tls_enable: "{{ grafana_tls_enable | default(false) | bool }}"
+    grafana_tls_secret: "{{ grafana_tls_secret | default('') }}"
+    grafana_cluster_issuer: "{{ grafana_cluster_issuer | default('') }}"
+    argocd_namespace: "{{ argocd_namespace | default('argocd') }}"
+    argocd_host: "{{ argocd_host | default('argocd.local') }}"
+    argocd_tls_enable: "{{ argocd_tls_enable | default(false) | bool }}"
+    argocd_tls_secret: "{{ argocd_tls_secret | default('') }}"
+    argocd_cluster_issuer: "{{ argocd_cluster_issuer | default('') }}"
+
+- name: Enable MicroK8s ingress controller (idempotent)
+  command: microk8s enable ingress
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ zfs_pool_host | default(inventory_hostname) }}"
+  run_once: true
+
+- name: Defaults for Grafana access
+  set_fact:
+    grafana_namespace: "{{ grafana_namespace | default('monitoring') }}"
+    grafana_host: "{{ grafana_host | default('grafana.local') }}"
+    ingress_class: "{{ ingress_class | default('nginx') }}"
+    grafana_tls_enable: "{{ grafana_tls_enable | default(false) | bool }}"
+    grafana_tls_secret: "{{ grafana_tls_secret | default('') }}"
+    grafana_cluster_issuer: "{{ grafana_cluster_issuer | default('') }}"
+  run_once: true
+
+# Ensure Grafana is actually up before exposing it
+- name: Wait for Grafana deployment to be Ready
+  command: microk8s kubectl -n {{ grafana_namespace }} rollout status deploy kube-prometheus-stack-grafana --timeout=10m
+  register: grafana_rollout
+  retries: 3
+  delay: 20
+  until: grafana_rollout.rc == 0
+  delegate_to: "{{ zfs_pool_host | default(inventory_hostname) }}"
+  run_once: true
+
+# Enable ingress (idempotent in MicroK8s)
+- name: Enable MicroK8s ingress controller
+  command: microk8s enable ingress
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ zfs_pool_host | default(inventory_hostname) }}"
+  run_once: true
+
+# Build and apply a minimal Ingress for Grafana
+# Compute annotations as a real dict (no block scalars)
+- name: Build Grafana annotations map
+  set_fact:
+    grafana_annotations: >-
+      {{
+        {'nginx.ingress.kubernetes.io/ssl-redirect': (grafana_tls_enable | ternary('true','false'))}
+        | combine(
+            (grafana_cluster_issuer | length > 0)
+            | ternary({'cert-manager.io/cluster-issuer': grafana_cluster_issuer}, {})
+          )
+      }}
+  run_once: true
+
+# Compute TLS section as a list (empty list when TLS not requested)
+# Ensure we have a TLS secret name (even if you don't enable TLS)
+- name: Compute Grafana TLS secret name
+  set_fact:
+    _gf_tls_secret_name: "{{ (grafana_tls_secret | default('') | length > 0) | ternary(grafana_tls_secret, 'grafana-tls') }}"
+  run_once: true
+  delegate_to: "{{ zfs_pool_host | default(inventory_hostname) }}"
+
+# Build annotations as a dict (works on older Jinja too)
+- name: Build Grafana annotations map
+  set_fact:
+    grafana_annotations: {}
+  run_once: true
+  delegate_to: "{{ zfs_pool_host | default(inventory_hostname) }}"
+
+- name: Add ssl-redirect annotation
+  set_fact:
+    grafana_annotations: "{{ grafana_annotations | combine({'nginx.ingress.kubernetes.io/ssl-redirect': (grafana_tls_enable | default(false) | bool) | ternary('true','false')}) }}"
+  run_once: true
+  delegate_to: "{{ zfs_pool_host | default(inventory_hostname) }}"
+
+- name: Add cert-manager cluster issuer (optional)
+  set_fact:
+    grafana_annotations: "{{ grafana_annotations | combine({'cert-manager.io/cluster-issuer': grafana_cluster_issuer}) }}"
+  when: grafana_cluster_issuer | default('') | length > 0
+  run_once: true
+  delegate_to: "{{ zfs_pool_host | default(inventory_hostname) }}"
+
+# Build TLS list safely (no inline Jinja list literals)
+- name: Init Grafana TLS section (empty)
+  set_fact:
+    grafana_tls_section: []
+  run_once: true
+  delegate_to: "{{ zfs_pool_host | default(inventory_hostname) }}"
+
+- name: Set Grafana TLS section when enabled
+  set_fact:
+    grafana_tls_section:
+      - hosts: ["{{ grafana_host }}"]
+        secretName: "{{ _gf_tls_secret_name }}"
+  when: (grafana_tls_enable | default(false) | bool) or (grafana_cluster_issuer | default('') | length > 0)
+  run_once: true
+  delegate_to: "{{ zfs_pool_host | default(inventory_hostname) }}"
+
+# Assemble the Ingress manifest as a dict
+- name: Build Grafana Ingress manifest (dict)
+  set_fact:
+    grafana_ing_doc:
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: grafana
+        namespace: "{{ grafana_namespace }}"
+        annotations: "{{ grafana_annotations }}"
+      spec:
+        ingressClassName: "{{ ingress_class }}"
+        rules:
+          - host: "{{ grafana_host }}"
+            http:
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: kube-prometheus-stack-grafana
+                      port:
+                        number: 80
+        tls: "{{ grafana_tls_section }}"
+  run_once: true
+  delegate_to: "{{ zfs_pool_host | default(inventory_hostname) }}"
+
+
+# Assemble the Ingress manifest as a dict (no Jinja control statements inside)
+- name: Build Grafana Ingress manifest (dict)
+  set_fact:
+    grafana_ing_doc:
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: grafana
+        namespace: "{{ grafana_namespace }}"
+        annotations: "{{ grafana_annotations }}"
+      spec:
+        ingressClassName: "{{ ingress_class }}"
+        rules:
+          - host: "{{ grafana_host }}"
+            http:
+              paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: kube-prometheus-stack-grafana
+                      port:
+                        number: 80
+        tls: "{{ grafana_tls_section }}"
+  run_once: true
+  delegate_to: "{{ zfs_pool_host | default(inventory_hostname) }}"
+
+- name: Write Grafana Ingress manifest
+  copy:
+    dest: "/tmp/ing-grafana.yaml"
+    content: "{{ grafana_ing_doc | to_nice_yaml }}"
+  delegate_to: "{{ zfs_pool_host | default(inventory_hostname) }}"
+  run_once: true
+
+- name: Apply Grafana Ingress
+  command: microk8s kubectl apply -f /tmp/ing-grafana.yaml
+  register: gf_ing_apply
+  changed_when: >
+    'created' in (gf_ing_apply.stdout | default('')) or
+    'configured' in (gf_ing_apply.stdout | default(''))
+  delegate_to: "{{ zfs_pool_host | default(inventory_hostname) }}"
+  run_once: true
+
+# Get and print the admin password from the chart’s secret
+- name: Read Grafana admin password (base64 -> plain)
+  command: >
+    microk8s kubectl -n {{ grafana_namespace }} get secret kube-prometheus-stack-grafana
+    -o jsonpath={.data.admin-password}
+  register: gf_pw_b64
+  changed_when: false
+  delegate_to: "{{ zfs_pool_host | default(inventory_hostname) }}"
+  run_once: true
+
+- name: Decode Grafana admin password
+  set_fact:
+    grafana_admin_password: "{{ gf_pw_b64.stdout | b64decode }}"
+  when: gf_pw_b64.stdout | length > 0
+  run_once: true
+
+- name: Show Grafana URL + admin password
+  debug:
+    msg:
+      - "Grafana URL: http://{{ grafana_host }}/"
+      - "Admin user: admin"
+      - "Admin password: {{ grafana_admin_password | default('UNKNOWN (secret not found yet)') }}"
+      - "If using UFW, ensure: sudo ufw allow 80,443/tcp"
+  run_once: true

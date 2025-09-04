@@ -1,0 +1,54 @@
+---
+# Optional: filter to only match your enclosure’s IDs (case-insensitive). Leave unset to take all usb-* drives.
+usb_enclosure_filter: ""   # e.g., "ORICO" or "WD"
+
+# Required: the host that owns/creates the external pool (has the enclosure attached)
+zfs_pool_host: nuc1
+
+external_zfs_pool: nucpool
+external_zfs_dataset: nucpool/k8s
+# nfs_export_dir should already be part of your flow if you export via NFS
+
+local_zfs_pool: localfastpool
+local_zfs_dataset: localfastpool/k8s
+local_zfs_devices:
+  - sda
+
+allow_external_wipe: true
+
+confirm_external_destroy: false   # double-confirm before destructive labelclear
+
+# Local per-node pools
+allow_local_wipe: false
+confirm_local_destroy: false      # double-confirm before destructive labelclear
+
+# Optional: constrain local-pool hosts (else runs on all)
+local_pool_hosts_group: "all"     # e.g., "control_planes" or "nucs"
+
+# Where to export if ZFS dataset mountpoint isn't found
+nfs_export_dir: "/mnt/{{ external_zfs_pool }}"
+# NFS export options you prefer
+nfs_export_options: "rw,sync,no_subtree_check,no_root_squash"
+
+
+# Local ZFS pool/dataset created earlier per node
+local_mount_base: "/mnt/{{ local_zfs_pool }}"
+
+# OpenEBS Helm versions (tweak if you want)
+openebs_helm_repo: "https://openebs.github.io/charts"
+openebs_chart: "openebs"
+openebs_chart_version: ""          # e.g., "3.9.0" or leave blank for latest
+zfs_localpv_chart: "zfs-localpv"
+zfs_localpv_chart_version: ""      # e.g., "2.4.0" or blank for latest
+
+# StorageClass name for local ZFS
+zfs_localpv_sc_name: "zfs-localpv"
+
+# Optional ZFS dataset tunables for PVs (applied by driver)
+zfs_localpv_params:
+  fstype: "zfs"
+  poolname: "{{ local_zfs_pool }}"
+  recordsize: "128k"
+  compression: "lz4"
+  # dedup: "off"   # enable only if you know you want it
+enable_local_path: false

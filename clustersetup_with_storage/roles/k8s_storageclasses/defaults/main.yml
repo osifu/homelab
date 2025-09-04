@@ -1,0 +1,39 @@
+# Control host to run microk8s kubectl/helm
+zfs_pool_host: nuc1
+
+# External (shared) ZFS → NFS CSI
+external_zfs_pool: nucpool
+external_zfs_dataset: nucpool/k8s
+nfs_export_options: "rw,sync,no_subtree_check,no_root_squash"
+
+# Local per-node ZFS (for local-path and ZFS LocalPV)
+local_zfs_pool: localfastpool
+local_zfs_dataset: localfastpool/k8s
+local_mount_base: "/mnt/{{ local_zfs_pool }}"
+
+# Helm repos/versions
+nfs_csi_chart_repo: "https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/master/charts"
+nfs_csi_chart: "csi-driver-nfs"
+nfs_csi_version: "v4.11.0"
+
+openebs_repo: "https://openebs.github.io/charts"
+openebs_chart: "openebs"
+openebs_version: ""         # latest
+zfs_localpv_chart: "zfs-localpv"
+zfs_localpv_version: ""     # latest
+
+# StorageClass names
+sc_nfs_external: "nfs-csi-external"
+sc_local_path: "local-zfs"
+sc_zfs_localpv: "zfs-localpv"
+
+# ZFS LocalPV parameters
+zfs_localpv_params:
+  fstype: "zfs"
+  poolname: "{{ local_zfs_pool }}"
+  recordsize: "128k"
+  compression: "lz4"
+
+# Optional vendor filter for external USB by-id discovery (not required here)
+usb_enclosure_filter: ""
+enable_local_path: false

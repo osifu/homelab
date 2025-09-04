@@ -1,0 +1,39 @@
+# ------------------------------
+# Expose Grafana via Ingress + print admin password
+# ------------------------------
+grafana_host: grafana.local
+ingress_class: nginx        # MicroK8s often uses "nginx"; some builds use "public"
+grafana_tls_enable: false   # optional TLS at ingress
+grafana_tls_secret: ""      # pre-created secret name if using TLS
+grafana_cluster_issuer: ""  # e.g. letsencrypt-prod (requires cert-manager)
+
+
+# Namespace to deploy the monitoring stack
+grafana_namespace: "monitoring"
+
+# StorageClass to use for persistent components (we want ZFS LocalPV)
+sc_zfs_localpv: "zfs-localpv"
+
+# Optional: pin kube-prometheus-stack chart version (unset = latest in repo)
+kps_version: ""
+
+# MicroK8s kubelet dir (different from upstream k8s)
+microk8s_kubelet_dir: "/var/snap/microk8s/common/var/lib/kubelet"
+
+# Sizes for PVCs
+kps_grafana_size: "10Gi"
+kps_alertmanager_size: "10Gi"
+kps_prometheus_size: "50Gi"
+
+# Minimal Alertmanager config (you can override in vars if you want receivers)
+kps_alertmanager_config:
+  global:
+    resolve_timeout: 5m
+  route:
+    group_by: ['alertname', 'job']
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 12h
+    receiver: 'null'
+  receivers:
+    - name: 'null'

@@ -1,0 +1,7 @@
+---
+- name: Deploy roles for debugging
+  hosts: all
+  become: true
+  roles:
+    - cloudflaretunnel
+

@@ -1,0 +1,55 @@
+---
+    - name: Generate join command (only on primary)
+      command: microk8s add-node --token-ttl {{ token_ttl }}
+      delegate_to: "{{ primary_cp }}"
+      register: join_cmd_raw
+      run_once: true
+      retries: 3
+      delay: 5
+      until: join_cmd_raw.rc == 0
+      failed_when: join_cmd_raw.rc != 0
+
+    - name: Extract join command from output
+      set_fact:
+        join_command: "{{ join_cmd_raw.stdout | regex_search('microk8s join.*') }}"
+      run_once: true
+
+    - name: Check if node already joined
+      command: microk8s kubectl get nodes
+      delegate_to: "{{ primary_cp }}"
+      run_once: true
+      register: already_joined
+
+    - name: Join additional control planes to the cluster
+      command: "{{ join_command }}"
+      when:
+        - inventory_hostname != primary_cp
+        - inventory_hostname not in already_joined.stdout
+        - inventory_hostname in groups['control_planes']
+      register: join_cp_attempt
+      retries: 3
+      delay: 20
+      until: join_cp_attempt.rc == 0
+      failed_when: join_cp_attempt.rc != 0
+
+
+    - name: Join worker nodes
+      command: "{{ join_command }} --worker"
+      when:
+        - inventory_hostname in groups['workers']
+        - inventory_hostname not in already_joined.stdout
+      register: join_worker_attempt
+      retries: 3
+      delay: 10
+      until: join_worker_attempt.rc == 0
+      failed_when: join_worker_attempt.rc != 0
+
+
+    - name: Wait for node to appear in cluster
+      command: microk8s kubectl get nodes
+      register: node_check
+      retries: 10
+      delay: 15
+      until: "'{{ inventory_hostname }}' in node_check.stdout"
+      delegate_to: "{{ primary_cp }}"
+      when: inventory_hostname != primary_cp

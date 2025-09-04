@@ -1,0 +1,9 @@
+# 1) Namespace (idempotent via apply)
+
+- name: Apply cloudflared Deployment
+  command: microk8s kubectl -n edge create -f /tmp/cloudflared-deploy.yaml
+  delegate_to: "{{ zfs_pool_host }}"
+
+- name: Wait for cloudflared rollout
+  command: microk8s kubectl -n edge rollout status deploy cloudflared --timeout=5m
+  delegate_to: "{{ zfs_pool_host }}"

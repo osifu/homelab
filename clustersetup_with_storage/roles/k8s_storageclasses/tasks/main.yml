@@ -1,0 +1,370 @@
+# 0) Pre-flight: ensure helm3 is available
+- name: Enable microk8s helm3
+  command: microk8s enable helm3
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+# 1) Helm repos
+- name: Add NFS CSI helm repo
+  command: microk8s helm3 repo add csi-driver-nfs {{ nfs_csi_chart_repo }}
+  register: nfs_repo_add
+  changed_when: "'has been added' in (nfs_repo_add.stdout | default(''))"
+  failed_when: false
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Add OpenEBS helm repo
+  command: microk8s helm3 repo add openebs {{ openebs_repo }}
+  register: oe_repo_add
+  changed_when: "'has been added' in (oe_repo_add.stdout | default(''))"
+  failed_when: false
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Helm repo update
+  command: microk8s helm3 repo update
+  changed_when: false
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+# 2) Detect/clear pending upgrade lock for OpenEBS (safe)
+- name: Get OpenEBS history JSON
+  command: microk8s helm3 history openebs -n openebs -o json
+  register: openebs_hist
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Parse OpenEBS history safely
+  set_fact:
+    openebs_history_list: "{{ (openebs_hist.stdout | default('[]') | from_json | default([])) if (openebs_hist.rc|default(1)) == 0 else [] }}"
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Build revision list
+  set_fact:
+    openebs_rev_list: "{{ openebs_history_list | map(attribute='revision') | list }}"
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Compute max revision
+  set_fact:
+    openebs_max_rev: "{{ (openebs_rev_list | max) if (openebs_rev_list | length) > 0 else 0 }}"
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Build last-matching entry list
+  set_fact:
+    openebs_last_matches: "{{ (openebs_history_list | selectattr('revision','equalto', openebs_max_rev) | list) if (openebs_max_rev | int) > 0 else [] }}"
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Set last entry and status
+  set_fact:
+    openebs_last: "{{ openebs_last_matches | first | default({}) }}"
+    openebs_last_status: "{{ openebs_last.status | default('') }}"
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Build deployed revisions list
+  set_fact:
+    openebs_deployed_revs: "{{ openebs_history_list | selectattr('status','equalto','deployed') | map(attribute='revision') | list }}"
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Compute last deployed revision (safe)
+  set_fact:
+    openebs_last_deployed_rev: "{{ (openebs_deployed_revs | max) if (openebs_deployed_revs | length) > 0 else 0 }}"
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+
+- name: Roll back pending release to last deployed (if any)
+  command: microk8s helm3 rollback openebs {{ openebs_last_deployed_rev }} -n openebs --wait --timeout 5m
+  when:
+    - openebs_last_status is match('^pending')
+    - openebs_last_deployed_rev|int > 0
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Delete pending release secret if no deployed rev
+  command: microk8s kubectl -n openebs delete secret sh.helm.release.v1.openebs.v{{ openebs_max_rev|int }}
+  when:
+    - openebs_last_status is match('^pending')
+    - openebs_last_deployed_rev|int == 0
+    - openebs_max_rev|int > 0
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+# 3) Install/upgrade OpenEBS (ZFS only)
+- name: Install/upgrade OpenEBS (ZFS only)
+  command: >
+    microk8s helm3 upgrade --install openebs openebs/openebs
+    --namespace openebs --create-namespace
+    --wait --atomic --timeout 10m
+    --set localpv-provisioner.enabled=false
+    --set engines.local.hostpath.enabled=false
+    --set engines.local.lvm.enabled=false
+    --set engines.local.zfs.enabled=true
+    --set engines.replicated.mayastor.enabled=false
+    --set loki.enabled=false
+    --set alloy.enabled=false
+    {{ (zfs_localpv_version is defined and (zfs_localpv_version|string)|length>0) | ternary('--version ' ~ (zfs_localpv_version|string), '') }}
+  register: oe_install
+  changed_when: "'STATUS: deployed' in (oe_install.stdout|default('')) or 'STATUS: upgraded' in (oe_install.stdout|default(''))"
+  retries: 2
+  delay: 20
+  until: oe_install.rc == 0
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+# 4) Wait for ZFS resources (auto-discovery to avoid name drift)
+- name: Discover ZFS LocalPV resources (deployments & daemonsets)
+  command: microk8s kubectl -n openebs get deploy,ds -o json
+  register: zfs_res
+  changed_when: false
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+# 1) Safely parse the kubectl JSON → items[]
+- name: Parse ZFS resources (items only)
+  set_fact:
+    zfs_items: >-
+      {{
+        (zfs_res.stdout | default("{}", true) | from_json | default({}))
+        .get('items', [])
+      }}
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+# 2) Derive names + fallbacks
+# Build the name lists first
+- name: Build ZFS deploy/DS name lists
+  set_fact:
+    zfs_deploy_names: "{{ zfs_items | selectattr('kind','equalto','Deployment') | map(attribute='metadata.name') | list }}"
+    zfs_ds_names:     "{{ zfs_items | selectattr('kind','equalto','DaemonSet')  | map(attribute='metadata.name') | list }}"
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+# Now compute the specific resource names using the lists
+- name: Derive ZFS controller and node resource names (with fallbacks)
+  set_fact:
+    zfs_controller_name: "{{ (zfs_deploy_names | select('search','zfs.*controller') | list | first) | default('openebs-zfs-localpv-controller') }}"
+    zfs_node_ds_name:    "{{ (zfs_ds_names     | select('search','zfs.*node')       | list | first) | default('openebs-zfs-localpv-node') }}"
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+
+
+- name: Wait for ZFS controller
+  command: microk8s kubectl -n openebs rollout status deploy {{ zfs_controller_name }} --timeout=300s
+  register: zfs_ctrl_rollout
+  retries: 6
+  delay: 20
+  until: zfs_ctrl_rollout.rc == 0
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Wait for ZFS node DS
+  command: microk8s kubectl -n openebs rollout status ds {{ zfs_node_ds_name }} --timeout=300s
+  register: zfs_node_rollout
+  retries: 6
+  delay: 20
+  until: zfs_node_rollout.rc == 0
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+# 5) Install/upgrade NFS CSI
+- name: Install/upgrade NFS CSI
+  command: >
+    microk8s helm3 upgrade --install csi-driver-nfs csi-driver-nfs/{{ nfs_csi_chart }}
+    --namespace kube-system --create-namespace
+    {{ (nfs_csi_version is defined and (nfs_csi_version|string)|length>0) | ternary('--version ' ~ (nfs_csi_version|string), '') }}
+  register: nfs_install
+  changed_when: "'STATUS: deployed' in (nfs_install.stdout|default('')) or 'STATUS: upgraded' in (nfs_install.stdout|default(''))"
+  retries: 3
+  delay: 10
+  until: nfs_install.rc == 0
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Wait for NFS CSI controller
+  command: microk8s kubectl -n kube-system rollout status deploy csi-nfs-controller --timeout=240s
+  register: nfsc_ctrl
+  retries: 6
+  delay: 10
+  until: nfsc_ctrl.rc == 0
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Wait for NFS CSI node DS
+  command: microk8s kubectl -n kube-system rollout status ds csi-nfs-node --timeout=240s
+  register: nfsc_node
+  retries: 6
+  delay: 10
+  until: nfsc_node.rc == 0
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+# Compute NFS export path from dataset mountpoint (fallback to /mnt/{{ external_zfs_pool }})
+- name: Compute NFS server/share using dataset mountpoint
+  command: zfs get -H -o value mountpoint {{ external_zfs_dataset }}
+  register: ext_mp
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: DEBUG - zfs get mountpoint
+  debug:
+    msg:
+      - "rc={{ ext_mp.rc | default('n/a') }}"
+      - "stdout={{ ext_mp.stdout | default('') | trim }}"
+      - "stderr={{ ext_mp.stderr | default('') | trim }}"
+  when: debug_enabled | default(true)
+
+# Choose export path based on mountpoint
+- name: Pick export path
+  set_fact:
+    nfs_export_path_external: >-
+      {{
+        (ext_mp.stdout | trim) if (ext_mp.stdout | default('') | trim) not in ['-', 'legacy', 'none', '']
+        else '/mnt/' ~ external_zfs_pool
+      }}
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: DEBUG - chosen NFS export path
+  debug:
+    var: nfs_export_path_external
+  when: debug_enabled | default(true)
+
+# Gather facts to pick the server IP address
+- name: Determine NUC server IP
+  setup:
+  register: nuc_setup
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: DEBUG - setup summary
+  debug:
+    msg:
+      - "default_ipv4={{ hostvars[zfs_pool_host].ansible_default_ipv4.address | default('n/a') }}"
+      - "first_ipv4={{ hostvars[zfs_pool_host].ansible_all_ipv4_addresses | default([]) | first | default('n/a') }}"
+  when: debug_enabled | default(true)
+
+# Choose IP for NFS server
+- name: Capture server IP
+  set_fact:
+    nfs_server_ip_external: "{{ hostvars[zfs_pool_host].ansible_default_ipv4.address | default(hostvars[zfs_pool_host].ansible_all_ipv4_addresses[0]) }}"
+  run_once: true
+  delegate_to: "{{ zfs_pool_host }}"
+
+- name: DEBUG - chosen NFS server IP
+  debug:
+    var: nfs_server_ip_external
+  when: debug_enabled | default(true)
+
+# 6) Build and apply StorageClasses (ZFS default=true; NFS default=false)
+- name: Ensure required vars for ZFS SC are set
+  assert:
+    that:
+      - sc_zfs_localpv is defined and sc_zfs_localpv | trim | length > 0
+      - zfs_pool_host is defined and zfs_pool_host | trim | length > 0
+      - zfs_localpv_params is defined
+      - zfs_localpv_params | type_debug == 'dict'
+      - zfs_localpv_params | length > 0
+    fail_msg: "Missing/invalid: sc_zfs_localpv, zfs_pool_host, or zfs_localpv_params."
+  run_once: true
+
+- name: Build ZFS SC manifest (default=true)
+  set_fact:
+    sc_zfs_doc:
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: "{{ sc_zfs_localpv }}"
+        annotations:
+          storageclass.kubernetes.io/is-default-class: "true"
+      provisioner: zfs.csi.openebs.io
+      volumeBindingMode: WaitForFirstConsumer
+      allowVolumeExpansion: true
+      reclaimPolicy: Delete
+      parameters: "{{ zfs_localpv_params }}"
+
+- name: Build NFS SC manifest (explicitly not default)
+  set_fact:
+    sc_nfs_doc:
+      apiVersion: storage.k8s.io/v1
+      kind: StorageClass
+      metadata:
+        name: "{{ sc_nfs_external }}"
+        annotations:
+          storageclass.kubernetes.io/is-default-class: "false"
+      provisioner: nfs.csi.k8s.io
+      parameters:
+        server: "{{ nfs_server_ip_external }}"
+        share: "{{ nfs_export_path_external }}"
+      mountOptions:
+        - nfsvers=4.1
+      reclaimPolicy: Delete
+      volumeBindingMode: Immediate
+      allowVolumeExpansion: true
+
+- name: Write SC files
+  copy:
+    dest: "/tmp/{{ item.name }}.yaml"
+    content: "{{ item.doc | to_nice_yaml }}"
+  loop:
+    - { name: "storageclass-{{ sc_zfs_localpv }}", doc: "{{ sc_zfs_doc }}" }
+    - { name: "storageclass-{{ sc_nfs_external }}", doc: "{{ sc_nfs_doc }}" }
+  loop_control:
+    label: "{{ item.name }}"
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Apply ZFS SC
+  command: "microk8s kubectl apply -f /tmp/storageclass-{{ sc_zfs_localpv }}.yaml"
+  register: zfs_sc_apply
+  changed_when: "'created' in (zfs_sc_apply.stdout|default('')) or 'configured' in (zfs_sc_apply.stdout|default(''))"
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Apply NFS SC
+  command: "microk8s kubectl apply -f /tmp/storageclass-{{ sc_nfs_external }}.yaml"
+  register: nfs_sc_apply
+  changed_when: "'created' in (nfs_sc_apply.stdout|default('')) or 'configured' in (nfs_sc_apply.stdout|default(''))"
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+# 7) Enforce default SC at runtime (strip default from others, set zfs)
+- name: Get StorageClasses
+  command: microk8s kubectl get sc -o json
+  register: sc_list2
+  changed_when: false
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Build SC names
+  set_fact:
+    sc_names2: "{{ (sc_list2.stdout | default('{}') | from_json | default({})).get('items', []) | map(attribute='metadata.name') | list }}"
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Remove default annotation from all other SCs
+  command: microk8s kubectl annotate sc {{ item }} storageclass.kubernetes.io/is-default-class- --overwrite
+  loop: "{{ sc_names2 | difference([sc_zfs_localpv]) }}"
+  register: rm_def
+  changed_when: "'annotated' in (rm_def.stdout | default(''))"
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
+
+- name: Mark {{ sc_zfs_localpv }} as default
+  command: microk8s kubectl annotate sc {{ sc_zfs_localpv }} storageclass.kubernetes.io/is-default-class=true --overwrite
+  register: set_def
+  changed_when: "'annotated' in (set_def.stdout | default(''))"
+  delegate_to: "{{ zfs_pool_host }}"
+  run_once: true
