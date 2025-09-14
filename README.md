@@ -251,7 +251,7 @@ This repo isn’t about polished guides — it’s about **dev logs**:
 Entries:  
 
 - [2025-09-03 — Lessons Learned: Vibe Coding My MicroK8s Cluster](./devlog/2025-09-03-microk8s-retro.md)
-- [2025-09-03 — Lessons Learned: Vibe Coding My MicroK8s Cluster](./devlog/homelab/devlog/2025-09-14-imac-gitlab-cloudflare.md)
+- [2025-09-14 — Standing Up iMac + GitLab CE + Cloudflare](./devlog/2025-09-14-imac-gitlab-cloudflare.md)
 
 ---
 
